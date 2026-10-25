@@ -46,6 +46,11 @@ jobs:
           toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
           components: clippy, rustfmt
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+
       - name: Install cargo-sort
         uses: taiki-e/install-action@v2
         with:
