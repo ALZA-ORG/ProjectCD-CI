@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  repository_dispatch:
+    types: [private-pr]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.client_payload.sha }}
+  cancel-in-progress: false
+
+env:
+  NIGHTLY_TOOLCHAIN: nightly-2026-10-01
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  check:
+    name: Formatting and Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Validate commit
+        shell: bash
+        env:
+          SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          [[ "$SHA" =~ ^[a-f0-9]{40}$ ]]
+
+      - name: Checkout private source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          ref: ${{ github.event.client_payload.sha }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: source
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Install cargo-sort
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-sort
+
+      - name: Check formatting
+        working-directory: source
+        shell: bash
+        run: |
+          cargo +${NIGHTLY_TOOLCHAIN} fmt --all -- --check
+          cargo +${NIGHTLY_TOOLCHAIN} sort -g --check --workspace
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential clang cmake ninja-build pkg-config \
+            libfontconfig1-dev libfreetype6-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libxcb-xkb-dev libxcb-cursor-dev libxcb-randr0-dev \
+            libxcb-xfixes0-dev libxcb-shape0-dev libxcb-render0-dev libxcb-sync-dev \
+            libxcb-present-dev libxcb-dri3-dev libasound2-dev libssl-dev libvulkan-dev \
+            mesa-vulkan-drivers libclang-dev libcups2-dev fonts-inter
+
+      - name: Run Clippy
+        working-directory: source
+        run: cargo +${{ env.NIGHTLY_TOOLCHAIN }} clippy --locked --workspace --all-targets
+
+  report:
+    name: Report PR status
+    needs: check
+    if: ${{ always() && needs.check.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Update private commit status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_STATUS_TOKEN }}
+          SOURCE_REPO: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          SHA: ${{ github.event.client_payload.sha }}
+          RESULT: ${{ needs.check.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ "$RESULT" = "success" ]; then
+            state=success
+            description="Formatting and Clippy passed"
+          else
+            state=failure
+            description="Formatting or Clippy failed"
+          fi
+
+          gh api --method POST \
+            "repos/$SOURCE_REPO/statuses/$SHA" \
+            -f state="$state" \
+            -f context="courtday-ci" \
+            -f description="$description" \
+            -f target_url="$RUN_URL" > /dev/null
