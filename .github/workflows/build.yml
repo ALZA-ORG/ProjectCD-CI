@@ -1,0 +1,141 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source branch, tag, or commit
+        required: true
+        default: main
+        type: string
+      mode:
+        description: Build mode
+        required: true
+        default: release
+        type: choice
+        options:
+          - debug
+          - release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  desktop:
+    name: Build (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: windows-x86_64
+            runner: windows-latest
+            binary: courtday.exe
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: source
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential clang cmake ninja-build pkg-config \
+            libfontconfig1-dev libfreetype6-dev libxkbcommon-x11-dev libwayland-dev \
+            libxcb1-dev libxcb-xkb-dev libxcb-cursor-dev libxcb-randr0-dev \
+            libxcb-xfixes0-dev libxcb-shape0-dev libxcb-render0-dev libxcb-sync-dev \
+            libxcb-present-dev libxcb-dri3-dev libasound2-dev libssl-dev libvulkan-dev \
+            mesa-vulkan-drivers libclang-dev libcups2-dev fonts-inter
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        working-directory: source
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "release" ]; then
+            cargo build --release --workspace
+          else
+            cargo build --workspace
+          fi
+
+      - name: Test binary
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          BINARY: ${{ matrix.platform.binary }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cp "source/target/$MODE/$BINARY" "$RUNNER_TEMP/smoke/"
+          cd "$RUNNER_TEMP/smoke"
+          "./$BINARY" --help
+
+      - name: Prepare binary
+        id: package
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          BINARY: ${{ matrix.platform.binary }}
+          PLATFORM: ${{ matrix.platform.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          extension=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            extension=".exe"
+          fi
+          filename="courtday-${PLATFORM}-${MODE}${extension}"
+          cp "source/target/$MODE/$BINARY" \
+            "$RUNNER_TEMP/release/$filename"
+          sha=$(git -C source rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "filename=$filename" >> "$GITHUB_OUTPUT"
+
+      - name: Upload private release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+          ARTIFACT_REPO: ${{ secrets.PRIVATE_ARTIFACT_REPO }}
+          SHA: ${{ steps.package.outputs.sha }}
+          FILENAME: ${{ steps.package.outputs.filename }}
+          MODE: ${{ inputs.mode }}
+          PLATFORM: ${{ matrix.platform.name }}
+        run: |
+          set -euo pipefail
+          tag="ci-${SHA:0:12}-${MODE}-${PLATFORM}"
+          asset="$RUNNER_TEMP/release/$FILENAME"
+
+          if gh release view "$tag" \
+            --repo "$ARTIFACT_REPO" > /dev/null 2>&1; then
+            gh release upload "$tag" "$asset" \
+              --repo "$ARTIFACT_REPO" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --repo "$ARTIFACT_REPO" \
+              --title "$tag" \
+              --notes "Automated build" \
+              --prerelease \
+              --latest=false
+          fi
