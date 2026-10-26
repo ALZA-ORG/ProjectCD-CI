@@ -16,12 +16,20 @@ on:
         options:
           - debug
           - release
+      platform:
+        description: Target platform
+        required: true
+        default: windows
+        type: choice
+        options:
+          - windows
+          - android
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ inputs.ref }}-${{ inputs.mode }}
+  group: build-${{ inputs.ref }}-${{ inputs.mode }}-${{ inputs.platform }}
   cancel-in-progress: false
 
 env:
@@ -31,6 +39,7 @@ env:
 
 jobs:
   desktop:
+    if: inputs.platform != 'android'
     name: Build (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 60
@@ -162,3 +171,199 @@ jobs:
 
           gh release upload "$TAG" "$asset" --repo "$ARTIFACT_REPO" --clobber
           gh release edit "$TAG" --repo "$ARTIFACT_REPO" --draft=false --latest=false
+
+  android:
+    name: Build (android-arm64)
+    if: inputs.platform == 'android'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NIGHTLY_TOOLCHAIN: nightly-2026-10-01
+      NDK_VERSION: 27.2.12479018
+      ANDROID_VERSION_CODE: ${{ github.run_number }}
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          persist-credentials: false
+          path: source
+
+      - name: Validate private delivery and signing configuration
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN || secrets.PRIVATE_SOURCE_TOKEN }}
+          ARTIFACT_REPO: ${{ secrets.PRIVATE_ARTIFACT_REPO || secrets.PRIVATE_SOURCE_REPO }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CERT_SHA256: ${{ vars.ANDROID_TEST_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$ARTIFACT_REPO" --jq '.private')" = true
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$CERT_SHA256"
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '12266719'
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK and NDK
+        shell: bash
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0" "ndk;$NDK_VERSION"
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+          components: clippy,rustfmt
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+          shared-key: android-arm64-ndk27-${{ inputs.mode }}
+          cache-workspace-crates: true
+          cache-on-failure: true
+
+      - name: Cache Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2,cargo-sort
+
+      - name: Check formatting and Android GPUI identity
+        id: checks
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/android-diagnostics"
+          cargo +${NIGHTLY_TOOLCHAIN} fmt --all -- --check > "$RUNNER_TEMP/android-diagnostics/fmt.log" 2>&1
+          cargo +${NIGHTLY_TOOLCHAIN} sort -g --check --workspace > "$RUNNER_TEMP/android-diagnostics/sort.log" 2>&1
+          python3 - <<'PY' > "$RUNNER_TEMP/android-diagnostics/identity.log" 2>&1
+          import os
+          import subprocess
+          import tomllib
+          lock = tomllib.load(open('Cargo.lock', 'rb'))
+          core = [p for p in lock['package'] if p['name'] == 'gpui-pre']
+          renderer = [p for p in lock['package'] if p['name'] == 'gpui-pre-wgpu']
+          assert len(core) == len(renderer) == 1
+          assert core[0]['version'] == renderer[0]['version'] == '0.3.9'
+          graph = subprocess.check_output(['cargo', '+' + os.environ['NIGHTLY_TOOLCHAIN'], 'tree', '--locked', '-p', 'court-mobile',
+              '--target', 'aarch64-linux-android', '-e', 'normal', '--prefix', 'none'], text=True)
+          assert 'gpui-pre v0.3.9' in graph
+          assert not any(name in graph for name in ('court-ui ', 'court-host ', 'printers v'))
+          PY
+
+      - name: Lint and compile Android library
+        working-directory: source
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+          cargo +${NIGHTLY_TOOLCHAIN} ndk -t arm64-v8a -P 26 clippy --locked -p court-mobile --lib -- -D warnings \
+            > "$RUNNER_TEMP/android-diagnostics/clippy.log" 2>&1
+          profile=()
+          if [ "$MODE" = release ]; then profile=(--release); fi
+          cargo +${NIGHTLY_TOOLCHAIN} ndk -t arm64-v8a -P 26 -o android/app/src/main/jniLibs \
+            build --locked -p court-mobile --lib "${profile[@]}" \
+            > "$RUNNER_TEMP/android-diagnostics/build.log" 2>&1
+
+      - name: Package and lint Android host
+        working-directory: source/android
+        shell: bash
+        run: |
+          status=0
+          ./gradlew --no-daemon --console=plain :app:assembleRelease :app:lintRelease \
+            > "$RUNNER_TEMP/android-diagnostics/gradle.log" 2>&1 || status=$?
+          report=app/build/intermediates/lint_intermediate_text_report/release/lintReportRelease/lint-results-release.txt
+          if [ -f "$report" ]; then
+            cp "$report" "$RUNNER_TEMP/android-diagnostics/lint.txt"
+          fi
+          exit "$status"
+
+      - name: Sign and verify APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CERT_SHA256: ${{ vars.ANDROID_TEST_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keystore="$RUNNER_TEMP/courtday-testing.p12"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          mkdir -p "$RUNNER_TEMP/release"
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          apk="$RUNNER_TEMP/release/courtday-android-arm64.apk"
+          "$tools/zipalign" -P 16 -f 4 \
+            source/android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" sign --ks "$keystore" --ks-type PKCS12 \
+            --ks-key-alias courtday-testing --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEYSTORE_PASSWORD --out "$apk" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/signature.txt"
+          actual=$(awk -F': ' '/Signer #1 certificate SHA-256 digest:/{print $2}' "$RUNNER_TEMP/signature.txt")
+          test "$actual" = "$CERT_SHA256"
+          "$tools/zipalign" -c -P 16 4 "$apk"
+          python3 - "$apk" <<'PY'
+          import sys
+          import zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              libraries = [name for name in apk.namelist() if name.startswith('lib/') and name.endswith('.so')]
+              assert 'lib/arm64-v8a/libcourt_mobile.so' in libraries
+              assert all(name.startswith('lib/arm64-v8a/') for name in libraries)
+              assert 'classes.dex' in apk.namelist()
+          PY
+
+      - name: Upload private APK or failure diagnostics
+        if: ${{ always() && !cancelled() && (steps.checks.outcome == 'success' || steps.checks.outcome == 'failure') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN || secrets.PRIVATE_SOURCE_TOKEN }}
+          ARTIFACT_REPO: ${{ secrets.PRIVATE_ARTIFACT_REPO || secrets.PRIVATE_SOURCE_REPO }}
+          SOURCE_REPO: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          MODE: ${{ inputs.mode }}
+          BUILD_RESULT: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$ARTIFACT_REPO" --jq '.private')" = true
+          sha=$(git -C source rev-parse HEAD)
+          tag="ci-${sha:0:12}-${MODE}-android-arm64"
+          target=()
+          if [ "$ARTIFACT_REPO" = "$SOURCE_REPO" ]; then target=(--target "$sha"); fi
+          if ! gh release view "$tag" --repo "$ARTIFACT_REPO" > /dev/null 2>&1; then
+            gh release create "$tag" --repo "$ARTIFACT_REPO" "${target[@]}" \
+              --title "$tag" --notes "Android platform-check build. Source commit: $sha. On-device acceptance pending." \
+              --draft --prerelease --latest=false
+          fi
+          if [ "$BUILD_RESULT" != success ]; then
+            archive="courtday-android-diagnostics-${GITHUB_RUN_ID}.tar.gz"
+            tar -czf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/android-diagnostics" .
+            gh release upload "$tag" "$RUNNER_TEMP/$archive" --repo "$ARTIFACT_REPO" --clobber
+            echo "::error::Android build failed; diagnostics were saved in the private draft release."
+            exit 0
+          fi
+          gh release upload "$tag" "$RUNNER_TEMP/release/courtday-android-arm64.apk" \
+            --repo "$ARTIFACT_REPO" --clobber
+          gh release edit "$tag" --repo "$ARTIFACT_REPO" --draft=false --latest=false
