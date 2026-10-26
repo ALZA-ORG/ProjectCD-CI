@@ -53,6 +53,36 @@ jobs:
           persist-credentials: false
           path: source
 
+      - name: Prepare private release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN || secrets.PRIVATE_SOURCE_TOKEN }}
+          ARTIFACT_REPO: ${{ secrets.PRIVATE_ARTIFACT_REPO || secrets.PRIVATE_SOURCE_REPO }}
+          SOURCE_REPO: ${{ secrets.PRIVATE_SOURCE_REPO }}
+          MODE: ${{ inputs.mode }}
+          PLATFORM: ${{ matrix.platform.name }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh api "repos/$ARTIFACT_REPO" --jq '.private')" != "true" ]; then
+            echo "::error::Build output requires a private repository"
+            exit 1
+          fi
+
+          sha=$(git -C source rev-parse HEAD)
+          tag="ci-${sha:0:12}-${MODE}-${PLATFORM}"
+          target=()
+          if [ "$ARTIFACT_REPO" = "$SOURCE_REPO" ]; then
+            target=(--target "$sha")
+          fi
+
+          if ! gh release view "$tag" --repo "$ARTIFACT_REPO" > /dev/null 2>&1; then
+            gh release create "$tag" --repo "$ARTIFACT_REPO" \
+              "${target[@]}" --title "$tag" --notes "Source commit: $sha" \
+              --draft --prerelease --latest=false
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -76,9 +106,9 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           if [ "$MODE" = "release" ]; then
-            cargo build --release --workspace
+            cargo build --locked --release --workspace
           else
-            cargo build --workspace
+            cargo build --locked --workspace
           fi
 
       - name: Test binary
@@ -116,26 +146,13 @@ jobs:
       - name: Upload private release
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
-          ARTIFACT_REPO: ${{ secrets.PRIVATE_ARTIFACT_REPO }}
-          SHA: ${{ steps.package.outputs.sha }}
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN || secrets.PRIVATE_SOURCE_TOKEN }}
+          ARTIFACT_REPO: ${{ secrets.PRIVATE_ARTIFACT_REPO || secrets.PRIVATE_SOURCE_REPO }}
+          TAG: ${{ steps.release.outputs.tag }}
           FILENAME: ${{ steps.package.outputs.filename }}
-          MODE: ${{ inputs.mode }}
-          PLATFORM: ${{ matrix.platform.name }}
         run: |
           set -euo pipefail
-          tag="ci-${SHA:0:12}-${MODE}-${PLATFORM}"
           asset="$RUNNER_TEMP/release/$FILENAME"
 
-          if gh release view "$tag" \
-            --repo "$ARTIFACT_REPO" > /dev/null 2>&1; then
-            gh release upload "$tag" "$asset" \
-              --repo "$ARTIFACT_REPO" --clobber
-          else
-            gh release create "$tag" "$asset" \
-              --repo "$ARTIFACT_REPO" \
-              --title "$tag" \
-              --notes "Automated build" \
-              --prerelease \
-              --latest=false
-          fi
+          gh release upload "$TAG" "$asset" --repo "$ARTIFACT_REPO" --clobber
+          gh release edit "$TAG" --repo "$ARTIFACT_REPO" --draft=false --latest=false
