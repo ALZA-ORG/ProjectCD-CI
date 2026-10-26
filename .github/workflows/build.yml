@@ -301,6 +301,17 @@ jobs:
           fi
           exit "$status"
 
+      - name: Verify Kotlin JNI bridge
+        shell: bash
+        run: |
+          javap -private source/android/app/build/tmp/kotlin-classes/release/dev/gpui/mobile/GpuiInputActivity.class \
+            > "$RUNNER_TEMP/android-diagnostics/jni.txt"
+          grep -Eq 'static .*native void nativeIme\(long, int, java.lang.String, int, int\)' "$RUNNER_TEMP/android-diagnostics/jni.txt"
+          grep -Eq 'static .*native void nativeInsets\(int, int, int, int\)' "$RUNNER_TEMP/android-diagnostics/jni.txt"
+          grep -Fq 'void gpuiShowKeyboard(int, long)' "$RUNNER_TEMP/android-diagnostics/jni.txt"
+          grep -Fq 'void gpuiHideKeyboard(long)' "$RUNNER_TEMP/android-diagnostics/jni.txt"
+          grep -Fq 'void gpuiResetComposition(long)' "$RUNNER_TEMP/android-diagnostics/jni.txt"
+
       - name: Sign and verify APK
         shell: bash
         env:
@@ -334,9 +345,15 @@ jobs:
               assert 'lib/arm64-v8a/libcourt_mobile.so' in libraries
               assert all(name.startswith('lib/arm64-v8a/') for name in libraries)
               assert 'classes.dex' in apk.namelist()
+          from pathlib import Path
+          apk = Path(sys.argv[1])
+          archive = apk.with_suffix('.zip')
+          with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
+              bundle.write(apk, apk.name)
+          print(f'APK: {apk.stat().st_size} bytes; ZIP: {archive.stat().st_size} bytes')
           PY
 
-      - name: Upload private APK or failure diagnostics
+      - name: Upload private APK ZIP or failure diagnostics
         if: ${{ always() && !cancelled() && (steps.checks.outcome == 'success' || steps.checks.outcome == 'failure') }}
         shell: bash
         env:
@@ -364,6 +381,6 @@ jobs:
             echo "::error::Android build failed; diagnostics were saved in the private draft release."
             exit 0
           fi
-          gh release upload "$tag" "$RUNNER_TEMP/release/courtday-android-arm64.apk" \
+          gh release upload "$tag" "$RUNNER_TEMP/release/courtday-android-arm64.zip" \
             --repo "$ARTIFACT_REPO" --clobber
           gh release edit "$tag" --repo "$ARTIFACT_REPO" --draft=false --latest=false
