@@ -99,6 +99,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+          shared-key: build-${{ matrix.platform.name }}-${{ inputs.mode }}
+          cache-workspace-crates: true
+
       - name: Build
         working-directory: source
         shell: bash
@@ -122,26 +129,25 @@ jobs:
           cd "$RUNNER_TEMP/smoke"
           "./$BINARY" --help
 
-      - name: Prepare binary
+      - name: Package ZIP
         id: package
-        shell: bash
+        shell: pwsh
         env:
           MODE: ${{ inputs.mode }}
           BINARY: ${{ matrix.platform.binary }}
+          BINARY_PATH: source/target/${{ inputs.mode }}/${{ matrix.platform.binary }}
           PLATFORM: ${{ matrix.platform.name }}
         run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/release"
-          extension=""
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            extension=".exe"
-          fi
-          filename="courtday-${PLATFORM}-${MODE}${extension}"
-          cp "source/target/$MODE/$BINARY" \
-            "$RUNNER_TEMP/release/$filename"
-          sha=$(git -C source rev-parse HEAD)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "filename=$filename" >> "$GITHUB_OUTPUT"
+          $ErrorActionPreference = 'Stop'
+          $releaseDirectory = Join-Path $env:RUNNER_TEMP 'release'
+          $packageDirectory = Join-Path $env:RUNNER_TEMP 'package'
+          New-Item -ItemType Directory -Force $releaseDirectory, $packageDirectory | Out-Null
+          $binaryPath = Join-Path $packageDirectory $env:BINARY
+          Copy-Item -LiteralPath $env:BINARY_PATH -Destination $binaryPath
+          $filename = "courtday-$($env:PLATFORM)-$($env:MODE).zip"
+          $archivePath = Join-Path $releaseDirectory $filename
+          Compress-Archive -LiteralPath $binaryPath -DestinationPath $archivePath -CompressionLevel Optimal
+          "filename=$filename" >> $env:GITHUB_OUTPUT
 
       - name: Upload private release
         shell: bash
